@@ -1,7 +1,6 @@
 import http.client
 import json
 import os
-import re
 import socket
 import sys
 import time
@@ -10,7 +9,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 ITEMS_URL = "https://api.warframe.market/v2/items"
@@ -50,11 +49,22 @@ RETRYABLE_HTTP_CODES = {
 }
 
 USER_AGENT = (
-    "What-To-Farm-WF/0.2 "
+    "What-To-Farm-WF/0.3 "
     "(https://github.com/minhOnlyWork/What-To-Farm-WF)"
 )
 
-SLUG_PATTERN = re.compile(r"^[a-z0-9_]+$")
+# Windows and Linux both treat slash as a path separator.
+# The remaining characters are invalid in Windows filenames.
+INVALID_SLUG_CHARACTERS = set('<>:"/\\|?*')
+
+WINDOWS_RESERVED_FILENAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *("COM{}".format(number) for number in range(1, 10)),
+    *("LPT{}".format(number) for number in range(1, 10)),
+}
 
 _last_request_time: Optional[float] = None
 
@@ -112,7 +122,6 @@ def wait_for_rate_limit() -> None:
 
     if _last_request_time is not None:
         elapsed = now - _last_request_time
-
         remaining = (
             MIN_REQUEST_INTERVAL_SECONDS - elapsed
         )
@@ -404,24 +413,67 @@ def read_json_file(
 
 
 def validate_slug(
-    raw_slug: str,
+    raw_slug: Any,
 ) -> str:
     """
-    Normalize and validate an item slug.
+    Validate an API slug without assuming ASCII-only text.
 
     Expected return:
-    A lowercase slug containing letters, numbers, and
-    underscores only.
+    The original non-empty slug, including valid Unicode,
+    parentheses, hyphens, and curly apostrophes.
     """
 
-    slug = raw_slug.strip().lower()
-
-    if not SLUG_PATTERN.fullmatch(slug):
+    if not isinstance(raw_slug, str):
         raise MarketDataError(
-            "Invalid item slug '{}'. Use lowercase "
-            "letters, numbers, and underscores only.".format(
-                raw_slug
+            "Item slug was not text."
+        )
+
+    slug = raw_slug.strip()
+
+    if not slug:
+        raise MarketDataError(
+            "Item slug was empty."
+        )
+
+    if slug != raw_slug:
+        raise MarketDataError(
+            "Item slug contains leading or trailing spaces: "
+            "'{}'.".format(raw_slug)
+        )
+
+    if slug in {".", ".."}:
+        raise MarketDataError(
+            "Item slug cannot be '.' or '..'."
+        )
+
+    for character in slug:
+        if ord(character) < 32:
+            raise MarketDataError(
+                "Item slug contains a control character: "
+                "'{}'.".format(slug)
             )
+
+        if character in INVALID_SLUG_CHARACTERS:
+            raise MarketDataError(
+                "Item slug contains an unsafe character "
+                "'{}': '{}'.".format(
+                    character,
+                    slug,
+                )
+            )
+
+    if slug.endswith((".", " ")):
+        raise MarketDataError(
+            "Item slug cannot end with a dot or space: "
+            "'{}'.".format(slug)
+        )
+
+    filename_stem = slug.split(".", 1)[0].upper()
+
+    if filename_stem in WINDOWS_RESERVED_FILENAMES:
+        raise MarketDataError(
+            "Item slug is a reserved Windows filename: "
+            "'{}'.".format(slug)
         )
 
     return slug
@@ -444,8 +496,8 @@ def validate_catalog_items(
 
     validated_items: List[Dict[str, Any]] = []
 
-    seen_ids = set()
-    seen_slugs = set()
+    seen_ids: Set[str] = set()
+    seen_slugs: Set[str] = set()
 
     for index, item in enumerate(items):
         if not isinstance(item, dict):
@@ -456,7 +508,6 @@ def validate_catalog_items(
             )
 
         item_id = item.get("id")
-        slug = item.get("slug")
 
         if (
             not isinstance(item_id, str)
@@ -468,15 +519,16 @@ def validate_catalog_items(
                 )
             )
 
-        if (
-            not isinstance(slug, str)
-            or not SLUG_PATTERN.fullmatch(slug)
-        ):
+        try:
+            slug = validate_slug(item.get("slug"))
+
+        except MarketDataError as error:
             raise MarketDataError(
-                "Catalog item {} has an invalid slug.".format(
-                    index
+                "Catalog item {} has an invalid slug: {}".format(
+                    index,
+                    error,
                 )
-            )
+            ) from error
 
         if item_id in seen_ids:
             raise MarketDataError(
@@ -762,7 +814,11 @@ def statistics_file_for_slug(
     data/statistics/<slug>.json
     """
 
-    return STATISTICS_DIR / "{}.json".format(slug)
+    safe_slug = validate_slug(slug)
+
+    return STATISTICS_DIR / "{}.json".format(
+        safe_slug
+    )
 
 
 def build_statistics_url(
@@ -775,8 +831,10 @@ def build_statistics_url(
     A complete Warframe.market statistics URL.
     """
 
+    safe_slug = validate_slug(slug)
+
     encoded_slug = urllib.parse.quote(
-        slug,
+        safe_slug,
         safe="",
     )
 
@@ -798,14 +856,7 @@ def download_statistics_for_item(
     Output path and validated statistics sections.
     """
 
-    raw_slug = item.get("slug")
-
-    if not isinstance(raw_slug, str):
-        raise MarketDataError(
-            "Catalog item has no valid slug."
-        )
-
-    slug = validate_slug(raw_slug)
+    slug = validate_slug(item.get("slug"))
     url = build_statistics_url(slug)
 
     response = fetch_json(url)
@@ -1043,6 +1094,36 @@ def save_batch_summary(
     )
 
 
+def save_running_summary_if_needed(
+    position: int,
+    started_at: str,
+    total_items: int,
+    downloaded: int,
+    skipped: int,
+    failed: int,
+    force_refresh: bool,
+) -> None:
+    """
+    Save batch progress after every 25 catalog positions.
+
+    Expected result:
+    The summary is updated at positions 25, 50, 75, etc.
+    """
+
+    if position % 25 != 0:
+        return
+
+    save_batch_summary(
+        started_at=started_at,
+        status="running",
+        total_items=total_items,
+        downloaded=downloaded,
+        skipped=skipped,
+        failed=failed,
+        force_refresh=force_refresh,
+    )
+
+
 def download_all_statistics(
     force_refresh: bool,
 ) -> int:
@@ -1097,30 +1178,40 @@ def download_all_statistics(
         ):
             raw_slug = item.get("slug")
 
-            if not isinstance(raw_slug, str):
-                failed += 1
+            try:
+                slug = validate_slug(raw_slug)
 
-                error = MarketDataError(
-                    "Catalog item has no valid slug."
-                )
+            except MarketDataError as error:
+                failed += 1
 
                 append_batch_error(
                     position=position,
                     total=total_items,
-                    slug="<invalid>",
+                    slug=str(raw_slug),
                     error=error,
                 )
 
                 print(
-                    "[{}/{}] [ERROR] Invalid catalog item.".format(
+                    "[{}/{}] [ERROR] Invalid catalog item: "
+                    "{}".format(
                         position,
                         total_items,
+                        error,
                     )
+                )
+
+                save_running_summary_if_needed(
+                    position=position,
+                    started_at=started_at,
+                    total_items=total_items,
+                    downloaded=downloaded,
+                    skipped=skipped,
+                    failed=failed,
+                    force_refresh=force_refresh,
                 )
 
                 continue
 
-            slug = raw_slug
             output_file = statistics_file_for_slug(
                 slug
             )
@@ -1140,6 +1231,16 @@ def download_all_statistics(
                         total_items,
                         slug,
                     )
+                )
+
+                save_running_summary_if_needed(
+                    position=position,
+                    started_at=started_at,
+                    total_items=total_items,
+                    downloaded=downloaded,
+                    skipped=skipped,
+                    failed=failed,
+                    force_refresh=force_refresh,
                 )
 
                 continue
@@ -1189,16 +1290,15 @@ def download_all_statistics(
                     )
                 )
 
-            if position % 25 == 0:
-                save_batch_summary(
-                    started_at=started_at,
-                    status="running",
-                    total_items=total_items,
-                    downloaded=downloaded,
-                    skipped=skipped,
-                    failed=failed,
-                    force_refresh=force_refresh,
-                )
+            save_running_summary_if_needed(
+                position=position,
+                started_at=started_at,
+                total_items=total_items,
+                downloaded=downloaded,
+                skipped=skipped,
+                failed=failed,
+                force_refresh=force_refresh,
+            )
 
     except KeyboardInterrupt:
         save_batch_summary(
