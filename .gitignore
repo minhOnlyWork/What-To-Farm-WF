@@ -216,3 +216,18 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated Warframe.market data
+data/items.json
+data/statistics/
+data/raw/
+data/processed/
+data/temp/
+
+# Local AI models and checkpoints
+models/
+checkpoints/
+*.safetensors
+*.pt
+*.pth
+*.onnx
