@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import re
@@ -9,21 +10,38 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 ITEMS_URL = "https://api.warframe.market/v2/items"
-STATS_URL = "https://api.warframe.market/v1/items/{slug}/statistics"
+STATISTICS_URL = (
+    "https://api.warframe.market/v1/items/"
+    "{slug}/statistics"
+)
 
-ROOT = Path(__file__).resolve().parent.parent
-ITEMS_FILE = ROOT / "data" / "items.json"
-STATS_DIR = ROOT / "data" / "statistics"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+ITEMS_FILE = PROJECT_ROOT / "data" / "items.json"
+STATISTICS_DIR = PROJECT_ROOT / "data" / "statistics"
+
+BATCH_SUMMARY_FILE = (
+    STATISTICS_DIR / "_download_summary.json"
+)
+
+BATCH_ERROR_FILE = (
+    STATISTICS_DIR / "_download_errors.jsonl"
+)
 
 TIMEOUT_SECONDS = 30
 MAX_ATTEMPTS = 3
 MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 
-RETRYABLE_CODES = {
+# 0.45 seconds means no more than about 2.22 requests
+# per second. This stays below the known 3 requests/second
+# public API limit.
+MIN_REQUEST_INTERVAL_SECONDS = 0.45
+
+RETRYABLE_HTTP_CODES = {
     429,
     500,
     502,
@@ -32,21 +50,44 @@ RETRYABLE_CODES = {
 }
 
 USER_AGENT = (
-    "What-To-Farm-WF/0.1 "
+    "What-To-Farm-WF/0.2 "
     "(https://github.com/minhOnlyWork/What-To-Farm-WF)"
 )
 
 SLUG_PATTERN = re.compile(r"^[a-z0-9_]+$")
 
+_last_request_time: Optional[float] = None
+
 
 class MarketDataError(RuntimeError):
-    pass
+    """Base exception for market data failures."""
+
+
+class MarketHttpError(MarketDataError):
+    """HTTP error containing its response status code."""
+
+    def __init__(
+        self,
+        status_code: int,
+        url: str,
+    ) -> None:
+        self.status_code = status_code
+        self.url = url
+
+        super().__init__(
+            "Warframe.market returned HTTP {} for '{}'.".format(
+                status_code,
+                url,
+            )
+        )
 
 
 def utc_now() -> str:
     """
+    Return the current UTC time.
+
     Expected return:
-    2026-07-22T14:30:00Z
+    2026-07-22T15:30:00Z
     """
 
     return (
@@ -56,21 +97,50 @@ def utc_now() -> str:
     )
 
 
-def retry_delay(
+def wait_for_rate_limit() -> None:
+    """
+    Wait long enough to respect the request interval.
+
+    Expected result:
+    Consecutive API requests begin at least 0.45 seconds
+    apart.
+    """
+
+    global _last_request_time
+
+    now = time.monotonic()
+
+    if _last_request_time is not None:
+        elapsed = now - _last_request_time
+
+        remaining = (
+            MIN_REQUEST_INTERVAL_SECONDS - elapsed
+        )
+
+        if remaining > 0:
+            time.sleep(remaining)
+
+    _last_request_time = time.monotonic()
+
+
+def get_retry_delay(
     attempt: int,
     retry_after: Optional[str],
 ) -> float:
     """
+    Return the retry delay.
+
     Expected return:
-    Retry-After when valid, otherwise 1, 2, then 4 seconds.
+    A valid Retry-After delay, otherwise 1, 2, or 4
+    seconds.
     """
 
     if retry_after is not None:
         try:
-            value = float(retry_after)
+            parsed_delay = float(retry_after)
 
-            if 0 <= value <= 60:
-                return value
+            if 0 <= parsed_delay <= 120:
+                return parsed_delay
 
         except ValueError:
             pass
@@ -78,13 +148,17 @@ def retry_delay(
     return float(2 ** (attempt - 1))
 
 
-def fetch_json(url: str) -> Dict[str, Any]:
+def build_request(
+    url: str,
+) -> urllib.request.Request:
     """
+    Build one identifiable JSON request.
+
     Expected return:
-    A non-empty JSON object from the requested API URL.
+    A GET request with the required headers.
     """
 
-    request = urllib.request.Request(
+    return urllib.request.Request(
         url,
         headers={
             "Accept": "application/json",
@@ -94,62 +168,85 @@ def fetch_json(url: str) -> Dict[str, Any]:
         method="GET",
     )
 
+
+def decode_json_response(
+    raw_data: bytes,
+) -> Dict[str, Any]:
+    """
+    Decode and validate a JSON response.
+
+    Expected return:
+    A non-empty JSON object.
+    """
+
+    if len(raw_data) > MAX_RESPONSE_BYTES:
+        raise MarketDataError(
+            "API response exceeded the 25 MB safety limit."
+        )
+
+    try:
+        text = raw_data.decode("utf-8")
+
+    except UnicodeDecodeError as error:
+        raise MarketDataError(
+            "API response was not valid UTF-8."
+        ) from error
+
+    try:
+        document = json.loads(text)
+
+    except json.JSONDecodeError as error:
+        raise MarketDataError(
+            "API returned invalid JSON."
+        ) from error
+
+    if not isinstance(document, dict):
+        raise MarketDataError(
+            "API response root was not a JSON object."
+        )
+
+    if not document:
+        raise MarketDataError(
+            "API returned an empty JSON object."
+        )
+
+    return document
+
+
+def fetch_json(
+    url: str,
+) -> Dict[str, Any]:
+    """
+    Download one JSON response with retries.
+
+    Expected return:
+    A decoded, non-empty JSON object.
+    """
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
+            wait_for_rate_limit()
+
+            request = build_request(url)
+
             with urllib.request.urlopen(
                 request,
                 timeout=TIMEOUT_SECONDS,
             ) as response:
-                raw = response.read(
+                raw_data = response.read(
                     MAX_RESPONSE_BYTES + 1
                 )
 
-            if len(raw) > MAX_RESPONSE_BYTES:
-                raise MarketDataError(
-                    "API response exceeded the 25 MB "
-                    "safety limit."
-                )
-
-            try:
-                decoded = raw.decode("utf-8")
-
-            except UnicodeDecodeError as error:
-                raise MarketDataError(
-                    "API response was not valid UTF-8."
-                ) from error
-
-            try:
-                result = json.loads(decoded)
-
-            except json.JSONDecodeError as error:
-                raise MarketDataError(
-                    "API returned invalid JSON."
-                ) from error
-
-            if not isinstance(result, dict):
-                raise MarketDataError(
-                    "API response root was not "
-                    "a JSON object."
-                )
-
-            if not result:
-                raise MarketDataError(
-                    "API returned an empty JSON object."
-                )
-
-            return result
+            return decode_json_response(raw_data)
 
         except urllib.error.HTTPError as error:
             if (
-                error.code not in RETRYABLE_CODES
+                error.code not in RETRYABLE_HTTP_CODES
                 or attempt == MAX_ATTEMPTS
             ):
-                raise MarketDataError(
-                    "Warframe.market returned HTTP {} "
-                    "for '{}'.".format(
-                        error.code,
-                        url,
-                    )
+                raise MarketHttpError(
+                    status_code=error.code,
+                    url=url,
                 ) from error
 
             retry_after = None
@@ -159,7 +256,7 @@ def fetch_json(url: str) -> Dict[str, Any]:
                     "Retry-After"
                 )
 
-            delay = retry_delay(
+            delay = get_retry_delay(
                 attempt,
                 retry_after,
             )
@@ -168,16 +265,19 @@ def fetch_json(url: str) -> Dict[str, Any]:
             urllib.error.URLError,
             TimeoutError,
             socket.timeout,
+            ConnectionError,
+            http.client.HTTPException,
         ) as error:
             if attempt == MAX_ATTEMPTS:
                 raise MarketDataError(
-                    "Could not connect after {} "
-                    "attempts.".format(
-                        MAX_ATTEMPTS
+                    "Could not connect to Warframe.market "
+                    "after {} attempts for '{}'.".format(
+                        MAX_ATTEMPTS,
+                        url,
                     )
                 ) from error
 
-            delay = retry_delay(
+            delay = get_retry_delay(
                 attempt,
                 None,
             )
@@ -197,13 +297,16 @@ def fetch_json(url: str) -> Dict[str, Any]:
     )
 
 
-def save_json(
+def save_json_atomic(
     document: Dict[str, Any],
     output_file: Path,
 ) -> None:
     """
+    Save a JSON file atomically.
+
     Expected result:
-    The complete JSON document is saved atomically.
+    The previous file remains intact unless the complete
+    new file is written successfully.
     """
 
     output_file.parent.mkdir(
@@ -252,38 +355,94 @@ def save_json(
         ) from error
 
 
-def validate_item_catalog(
-    response: Dict[str, Any],
-) -> List[Dict[str, Any]]:
+def read_json_file(
+    input_file: Path,
+) -> Dict[str, Any]:
     """
+    Read one local JSON object.
+
     Expected return:
-    A validated, non-empty item list.
+    A JSON object loaded from the file.
     """
 
-    api_error = response.get("error")
+    try:
+        with input_file.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            document = json.load(file)
 
-    if api_error is not None:
+    except FileNotFoundError as error:
         raise MarketDataError(
-            "Item API returned an error: {!r}".format(
-                api_error
+            "File not found: '{}'.".format(
+                input_file
+            )
+        ) from error
+
+    except json.JSONDecodeError as error:
+        raise MarketDataError(
+            "File contains invalid JSON: '{}'.".format(
+                input_file
+            )
+        ) from error
+
+    except OSError as error:
+        raise MarketDataError(
+            "Could not read '{}'.".format(
+                input_file
+            )
+        ) from error
+
+    if not isinstance(document, dict):
+        raise MarketDataError(
+            "JSON root was not an object in '{}'.".format(
+                input_file
             )
         )
 
-    api_version = response.get("apiVersion")
-    items = response.get("data")
+    return document
 
-    if (
-        not isinstance(api_version, str)
-        or not api_version
-    ):
+
+def validate_slug(
+    raw_slug: str,
+) -> str:
+    """
+    Normalize and validate an item slug.
+
+    Expected return:
+    A lowercase slug containing letters, numbers, and
+    underscores only.
+    """
+
+    slug = raw_slug.strip().lower()
+
+    if not SLUG_PATTERN.fullmatch(slug):
         raise MarketDataError(
-            "Missing or invalid API version."
+            "Invalid item slug '{}'. Use lowercase "
+            "letters, numbers, and underscores only.".format(
+                raw_slug
+            )
         )
+
+    return slug
+
+
+def validate_catalog_items(
+    items: Any,
+) -> List[Dict[str, Any]]:
+    """
+    Validate catalog items and reject duplicate identifiers.
+
+    Expected return:
+    A non-empty list of item dictionaries.
+    """
 
     if not isinstance(items, list) or not items:
         raise MarketDataError(
-            "Missing or empty item list."
+            "Item catalog is missing or empty."
         )
+
+    validated_items: List[Dict[str, Any]] = []
 
     seen_ids = set()
     seen_slugs = set()
@@ -291,7 +450,7 @@ def validate_item_catalog(
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             raise MarketDataError(
-                "Item {} was not a JSON object.".format(
+                "Catalog item {} was not a JSON object.".format(
                     index
                 )
             )
@@ -301,10 +460,10 @@ def validate_item_catalog(
 
         if (
             not isinstance(item_id, str)
-            or not item_id
+            or not item_id.strip()
         ):
             raise MarketDataError(
-                "Item {} has an invalid id.".format(
+                "Catalog item {} has an invalid id.".format(
                     index
                 )
             )
@@ -314,21 +473,21 @@ def validate_item_catalog(
             or not SLUG_PATTERN.fullmatch(slug)
         ):
             raise MarketDataError(
-                "Item {} has an invalid slug.".format(
+                "Catalog item {} has an invalid slug.".format(
                     index
                 )
             )
 
         if item_id in seen_ids:
             raise MarketDataError(
-                "Duplicate item id: {}".format(
+                "Duplicate catalog item id: '{}'.".format(
                     item_id
                 )
             )
 
         if slug in seen_slugs:
             raise MarketDataError(
-                "Duplicate item slug: {}".format(
+                "Duplicate catalog item slug: '{}'.".format(
                     slug
                 )
             )
@@ -336,26 +495,70 @@ def validate_item_catalog(
         seen_ids.add(item_id)
         seen_slugs.add(slug)
 
-    return items
+        validated_items.append(item)
+
+    return validated_items
 
 
-def download_items() -> None:
+def validate_item_catalog_response(
+    response: Dict[str, Any],
+) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    Download and save the complete tradable item catalog.
+    Validate the item-catalog API response.
+
+    Expected return:
+    The API version and validated item list.
+    """
+
+    api_error = response.get("error")
+
+    if api_error is not None:
+        raise MarketDataError(
+            "Item API returned an error: {!r}.".format(
+                api_error
+            )
+        )
+
+    api_version = response.get("apiVersion")
+
+    if (
+        not isinstance(api_version, str)
+        or not api_version.strip()
+    ):
+        raise MarketDataError(
+            "Item API returned an invalid apiVersion."
+        )
+
+    items = validate_catalog_items(
+        response.get("data")
+    )
+
+    return api_version, items
+
+
+def download_items() -> int:
+    """
+    Download and save the complete item catalog.
+
+    Expected return:
+    Number of validated catalog items.
     """
 
     response = fetch_json(ITEMS_URL)
-    items = validate_item_catalog(response)
+
+    api_version, items = (
+        validate_item_catalog_response(response)
+    )
 
     document = {
         "source": ITEMS_URL,
         "downloaded_at": utc_now(),
-        "api_version": response["apiVersion"],
+        "api_version": api_version,
         "item_count": len(items),
         "items": items,
     }
 
-    save_json(
+    save_json_atomic(
         document,
         ITEMS_FILE,
     )
@@ -364,32 +567,31 @@ def download_items() -> None:
         "[SUCCESS] Item catalog downloaded "
         "and validated."
     )
-
     print(
         "[SUCCESS] API version: {}".format(
-            response["apiVersion"]
+            api_version
         )
     )
-
     print(
         "[SUCCESS] Item count: {}".format(
             len(items)
         )
     )
-
     print(
         "[SUCCESS] Saved to: {}".format(
             ITEMS_FILE
         )
     )
 
+    return len(items)
 
-def load_item(
-    slug: str,
-) -> Dict[str, Any]:
+
+def load_catalog_items() -> List[Dict[str, Any]]:
     """
+    Load the local item catalog.
+
     Expected return:
-    The catalog item whose slug exactly matches.
+    The validated list stored in data/items.json.
     """
 
     if not ITEMS_FILE.is_file():
@@ -398,47 +600,32 @@ def load_item(
             "'python app\\market.py items' first."
         )
 
-    try:
-        with ITEMS_FILE.open(
-            "r",
-            encoding="utf-8",
-        ) as file:
-            document = json.load(file)
+    document = read_json_file(ITEMS_FILE)
 
-    except json.JSONDecodeError as error:
-        raise MarketDataError(
-            "data/items.json contains invalid JSON."
-        ) from error
+    return validate_catalog_items(
+        document.get("items")
+    )
 
-    except OSError as error:
-        raise MarketDataError(
-            "Could not read data/items.json."
-        ) from error
 
-    if not isinstance(document, dict):
-        raise MarketDataError(
-            "data/items.json root is not "
-            "a JSON object."
-        )
+def find_catalog_item(
+    items: List[Dict[str, Any]],
+    slug: str,
+) -> Dict[str, Any]:
+    """
+    Find one catalog item by exact slug.
 
-    items = document.get("items")
-
-    if not isinstance(items, list):
-        raise MarketDataError(
-            "data/items.json has no valid "
-            "items list."
-        )
+    Expected return:
+    The matching catalog item.
+    """
 
     for item in items:
-        if (
-            isinstance(item, dict)
-            and item.get("slug") == slug
-        ):
+        if item.get("slug") == slug:
             return item
 
     raise MarketDataError(
-        "Slug '{}' was not found in "
-        "data/items.json.".format(slug)
+        "Slug '{}' was not found in data/items.json.".format(
+            slug
+        )
     )
 
 
@@ -446,8 +633,10 @@ def get_item_name(
     item: Dict[str, Any],
 ) -> str:
     """
+    Return the English item name.
+
     Expected return:
-    English item name or its slug as fallback.
+    English name, or the slug as a fallback.
     """
 
     i18n = item.get("i18n")
@@ -466,34 +655,35 @@ def get_item_name(
 
     slug = item.get("slug")
 
-    if isinstance(slug, str):
+    if isinstance(slug, str) and slug:
         return slug
 
     return "Unknown item"
 
 
-def validate_statistics(
+def validate_statistics_response(
     response: Dict[str, Any],
-) -> Dict[
-    str,
-    Dict[str, List[Dict[str, Any]]],
-]:
+) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
     """
-    Validate both statistics sections and every returned
-    time window.
+    Validate every statistics section and time window.
 
-    The original API response is still saved unchanged.
+    The raw response is still saved without removing fields.
+
+    Expected return:
+    Validated statistics sections and their record lists.
     """
 
     payload = response.get("payload")
 
     if not isinstance(payload, dict):
         raise MarketDataError(
-            "Statistics response has no valid "
-            "payload object."
+            "Statistics response has no valid payload."
         )
 
-    validated = {}
+    validated_sections: Dict[
+        str,
+        Dict[str, List[Dict[str, Any]]],
+    ] = {}
 
     for section_name in (
         "statistics_closed",
@@ -503,18 +693,20 @@ def validate_statistics(
 
         if not isinstance(section, dict):
             raise MarketDataError(
-                "Missing or invalid '{}'.".format(
+                "Statistics response is missing '{}'.".format(
                     section_name
                 )
             )
 
-        windows = {}
+        validated_windows: Dict[
+            str,
+            List[Dict[str, Any]],
+        ] = {}
 
         for window_name, records in section.items():
             if not isinstance(window_name, str):
                 raise MarketDataError(
-                    "A statistics window name "
-                    "was not text."
+                    "Statistics window name was not text."
                 )
 
             if not isinstance(records, list):
@@ -528,65 +720,101 @@ def validate_statistics(
             for index, record in enumerate(records):
                 if not isinstance(record, dict):
                     raise MarketDataError(
-                        "Record {} in '{}.{}' was "
-                        "not a JSON object.".format(
+                        "Record {} in '{}.{}' was not "
+                        "a JSON object.".format(
                             index,
                             section_name,
                             window_name,
                         )
                     )
 
-            windows[window_name] = records
+                datetime_value = record.get("datetime")
 
-        validated[section_name] = windows
+                if (
+                    not isinstance(datetime_value, str)
+                    or not datetime_value
+                ):
+                    raise MarketDataError(
+                        "Record {} in '{}.{}' has an "
+                        "invalid datetime.".format(
+                            index,
+                            section_name,
+                            window_name,
+                        )
+                    )
 
-    if not any(validated.values()):
-        raise MarketDataError(
-            "Statistics response contained "
-            "no time windows."
+            validated_windows[window_name] = records
+
+        validated_sections[section_name] = (
+            validated_windows
         )
 
-    return validated
+    return validated_sections
 
 
-def download_statistics(
-    raw_slug: str,
-) -> None:
+def statistics_file_for_slug(
+    slug: str,
+) -> Path:
     """
-    Download every field returned for one item's
-    Statistics page.
+    Build the local statistics filename.
+
+    Expected return:
+    data/statistics/<slug>.json
     """
 
-    slug = raw_slug.strip().lower()
+    return STATISTICS_DIR / "{}.json".format(slug)
 
-    if not SLUG_PATTERN.fullmatch(slug):
-        raise MarketDataError(
-            "Invalid slug '{}'. Use lowercase "
-            "letters, numbers, and underscores "
-            "only.".format(raw_slug)
-        )
 
-    item = load_item(slug)
+def build_statistics_url(
+    slug: str,
+) -> str:
+    """
+    Build the encoded statistics endpoint.
+
+    Expected return:
+    A complete Warframe.market statistics URL.
+    """
 
     encoded_slug = urllib.parse.quote(
         slug,
         safe="",
     )
 
-    url = STATS_URL.format(
+    return STATISTICS_URL.format(
         slug=encoded_slug
     )
 
+
+def download_statistics_for_item(
+    item: Dict[str, Any],
+) -> Tuple[
+    Path,
+    Dict[str, Dict[str, List[Dict[str, Any]]]],
+]:
+    """
+    Download and save every raw statistics field for one item.
+
+    Expected return:
+    Output path and validated statistics sections.
+    """
+
+    raw_slug = item.get("slug")
+
+    if not isinstance(raw_slug, str):
+        raise MarketDataError(
+            "Catalog item has no valid slug."
+        )
+
+    slug = validate_slug(raw_slug)
+    url = build_statistics_url(slug)
+
     response = fetch_json(url)
 
-    sections = validate_statistics(
+    sections = validate_statistics_response(
         response
     )
 
-    output_file = (
-        STATS_DIR
-        / "{}.json".format(slug)
-    )
+    output_file = statistics_file_for_slug(slug)
 
     document = {
         "source": url,
@@ -600,22 +828,43 @@ def download_statistics(
         "raw_response": response,
     }
 
-    save_json(
+    save_json_atomic(
         document,
         output_file,
+    )
+
+    return output_file, sections
+
+
+def download_statistics(
+    raw_slug: str,
+) -> None:
+    """
+    Download statistics for one selected item.
+    """
+
+    slug = validate_slug(raw_slug)
+
+    items = load_catalog_items()
+
+    item = find_catalog_item(
+        items,
+        slug,
+    )
+
+    output_file, sections = (
+        download_statistics_for_item(item)
     )
 
     print(
         "[SUCCESS] Statistics downloaded "
         "and validated."
     )
-
     print(
         "[SUCCESS] Item: {}".format(
             get_item_name(item)
         )
     )
-
     print(
         "[SUCCESS] Slug: {}".format(
             slug
@@ -623,13 +872,6 @@ def download_statistics(
     )
 
     for section_name, windows in sections.items():
-        if not windows:
-            print(
-                "[SUCCESS] {}: no windows".format(
-                    section_name
-                )
-            )
-
         for window_name, records in windows.items():
             print(
                 "[SUCCESS] {}.{}: {} records".format(
@@ -646,24 +888,399 @@ def download_statistics(
     )
 
 
+def saved_statistics_are_valid(
+    output_file: Path,
+    expected_slug: str,
+) -> bool:
+    """
+    Check whether a previously saved statistics file can
+    safely be skipped.
+
+    Expected return:
+    True only when the file is readable, matches the slug,
+    and contains valid statistics sections.
+    """
+
+    if not output_file.is_file():
+        return False
+
+    try:
+        document = read_json_file(output_file)
+
+        item = document.get("item")
+
+        if not isinstance(item, dict):
+            return False
+
+        if item.get("slug") != expected_slug:
+            return False
+
+        raw_response = document.get("raw_response")
+
+        if not isinstance(raw_response, dict):
+            return False
+
+        validate_statistics_response(raw_response)
+
+        return True
+
+    except MarketDataError:
+        return False
+
+
+def reset_batch_error_log() -> None:
+    """
+    Remove the previous batch error log.
+
+    Expected result:
+    A new batch starts with an empty error log.
+    """
+
+    STATISTICS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    try:
+        if BATCH_ERROR_FILE.exists():
+            BATCH_ERROR_FILE.unlink()
+
+    except OSError as error:
+        raise MarketDataError(
+            "Could not reset '{}'.".format(
+                BATCH_ERROR_FILE
+            )
+        ) from error
+
+
+def append_batch_error(
+    position: int,
+    total: int,
+    slug: str,
+    error: Exception,
+) -> None:
+    """
+    Append one failed item to the JSON Lines error log.
+
+    Expected result:
+    One independent JSON object is appended.
+    """
+
+    record = {
+        "recorded_at": utc_now(),
+        "position": position,
+        "total": total,
+        "slug": slug,
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+
+    if isinstance(error, MarketHttpError):
+        record["http_status"] = error.status_code
+
+    try:
+        BATCH_ERROR_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with BATCH_ERROR_FILE.open(
+            "a",
+            encoding="utf-8",
+            newline="\n",
+        ) as file:
+            file.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                )
+            )
+            file.write("\n")
+            file.flush()
+
+    except OSError as log_error:
+        raise MarketDataError(
+            "Could not write batch error log."
+        ) from log_error
+
+
+def save_batch_summary(
+    started_at: str,
+    status: str,
+    total_items: int,
+    downloaded: int,
+    skipped: int,
+    failed: int,
+    force_refresh: bool,
+) -> None:
+    """
+    Save the current all-item download status.
+
+    Expected result:
+    A summary JSON file that survives interruptions.
+    """
+
+    summary = {
+        "started_at": started_at,
+        "updated_at": utc_now(),
+        "status": status,
+        "total_items": total_items,
+        "processed": downloaded + skipped + failed,
+        "downloaded": downloaded,
+        "skipped": skipped,
+        "failed": failed,
+        "force_refresh": force_refresh,
+        "error_log": (
+            str(BATCH_ERROR_FILE)
+            if failed > 0
+            else None
+        ),
+    }
+
+    save_json_atomic(
+        summary,
+        BATCH_SUMMARY_FILE,
+    )
+
+
+def download_all_statistics(
+    force_refresh: bool,
+) -> int:
+    """
+    Download statistics for every item in the catalog.
+
+    Existing valid files are skipped unless --force is used.
+
+    Expected return:
+    Number of failed items.
+    """
+
+    items = load_catalog_items()
+
+    total_items = len(items)
+    started_at = utc_now()
+
+    downloaded = 0
+    skipped = 0
+    failed = 0
+
+    reset_batch_error_log()
+
+    save_batch_summary(
+        started_at=started_at,
+        status="running",
+        total_items=total_items,
+        downloaded=downloaded,
+        skipped=skipped,
+        failed=failed,
+        force_refresh=force_refresh,
+    )
+
+    print(
+        "[START] Downloading statistics for "
+        "{} items.".format(total_items)
+    )
+
+    if force_refresh:
+        print(
+            "[START] Force refresh is enabled."
+        )
+    else:
+        print(
+            "[START] Valid existing files will be skipped."
+        )
+
+    try:
+        for position, item in enumerate(
+            items,
+            start=1,
+        ):
+            raw_slug = item.get("slug")
+
+            if not isinstance(raw_slug, str):
+                failed += 1
+
+                error = MarketDataError(
+                    "Catalog item has no valid slug."
+                )
+
+                append_batch_error(
+                    position=position,
+                    total=total_items,
+                    slug="<invalid>",
+                    error=error,
+                )
+
+                print(
+                    "[{}/{}] [ERROR] Invalid catalog item.".format(
+                        position,
+                        total_items,
+                    )
+                )
+
+                continue
+
+            slug = raw_slug
+            output_file = statistics_file_for_slug(
+                slug
+            )
+
+            if (
+                not force_refresh
+                and saved_statistics_are_valid(
+                    output_file,
+                    slug,
+                )
+            ):
+                skipped += 1
+
+                print(
+                    "[{}/{}] [SKIP] {}".format(
+                        position,
+                        total_items,
+                        slug,
+                    )
+                )
+
+                continue
+
+            if (
+                output_file.exists()
+                and not force_refresh
+            ):
+                print(
+                    "[{}/{}] [REDOWNLOAD] {} "
+                    "has an invalid local file.".format(
+                        position,
+                        total_items,
+                        slug,
+                    )
+                )
+
+            try:
+                download_statistics_for_item(item)
+
+                downloaded += 1
+
+                print(
+                    "[{}/{}] [OK] {}".format(
+                        position,
+                        total_items,
+                        slug,
+                    )
+                )
+
+            except MarketDataError as error:
+                failed += 1
+
+                append_batch_error(
+                    position=position,
+                    total=total_items,
+                    slug=slug,
+                    error=error,
+                )
+
+                print(
+                    "[{}/{}] [ERROR] {}: {}".format(
+                        position,
+                        total_items,
+                        slug,
+                        error,
+                    )
+                )
+
+            if position % 25 == 0:
+                save_batch_summary(
+                    started_at=started_at,
+                    status="running",
+                    total_items=total_items,
+                    downloaded=downloaded,
+                    skipped=skipped,
+                    failed=failed,
+                    force_refresh=force_refresh,
+                )
+
+    except KeyboardInterrupt:
+        save_batch_summary(
+            started_at=started_at,
+            status="interrupted",
+            total_items=total_items,
+            downloaded=downloaded,
+            skipped=skipped,
+            failed=failed,
+            force_refresh=force_refresh,
+        )
+
+        raise
+
+    save_batch_summary(
+        started_at=started_at,
+        status="completed",
+        total_items=total_items,
+        downloaded=downloaded,
+        skipped=skipped,
+        failed=failed,
+        force_refresh=force_refresh,
+    )
+
+    print()
+    print("[COMPLETE] Batch download finished.")
+    print(
+        "[COMPLETE] Downloaded: {}".format(
+            downloaded
+        )
+    )
+    print(
+        "[COMPLETE] Skipped: {}".format(
+            skipped
+        )
+    )
+    print(
+        "[COMPLETE] Failed: {}".format(
+            failed
+        )
+    )
+    print(
+        "[COMPLETE] Summary: {}".format(
+            BATCH_SUMMARY_FILE
+        )
+    )
+
+    if failed > 0:
+        print(
+            "[COMPLETE] Error log: {}".format(
+                BATCH_ERROR_FILE
+            )
+        )
+
+    return failed
+
+
 def print_usage() -> None:
+    """Print all supported commands."""
+
     print("Usage:")
     print(r"  python app\market.py items")
     print(r"  python app\market.py stats <item_slug>")
+    print(r"  python app\market.py all-stats")
+    print(r"  python app\market.py all-stats --force")
     print()
-    print("Example:")
+    print("Examples:")
     print(
         r"  python app\market.py "
         r"stats secura_dual_cestra"
+    )
+    print(
+        r"  python app\market.py all-stats"
     )
 
 
 def main() -> int:
     """
-    Run one supported command.
+    Run one market-data command.
 
     Expected return:
-    0 for success, non-zero for an error.
+    0 for success and non-zero for failure.
     """
 
     try:
@@ -681,8 +1298,28 @@ def main() -> int:
             download_statistics(
                 sys.argv[2]
             )
-
             return 0
+
+        if (
+            len(sys.argv) == 2
+            and sys.argv[1] == "all-stats"
+        ):
+            failure_count = download_all_statistics(
+                force_refresh=False
+            )
+
+            return 1 if failure_count > 0 else 0
+
+        if (
+            len(sys.argv) == 3
+            and sys.argv[1] == "all-stats"
+            and sys.argv[2] == "--force"
+        ):
+            failure_count = download_all_statistics(
+                force_refresh=True
+            )
+
+            return 1 if failure_count > 0 else 0
 
         print_usage()
         return 2
@@ -692,16 +1329,13 @@ def main() -> int:
             "[ERROR] {}".format(error),
             file=sys.stderr,
         )
-
         return 1
 
     except KeyboardInterrupt:
         print(
-            "\n[CANCELLED] Operation "
-            "cancelled by user.",
+            "\n[CANCELLED] Operation cancelled by user.",
             file=sys.stderr,
         )
-
         return 130
 
 
